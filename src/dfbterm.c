@@ -98,6 +98,16 @@ static void add_flip( Term *term, DFBRegion *region )
      }
 }
 
+static void term_flush_flip( Term *term )
+{
+     if (term->flip_pending) {
+          term->surface->Flip( term->surface, &term->flip_region,
+                               getenv( "LITE_WINDOW_DOUBLEBUFFER" ) ? DSFLIP_BLIT : DSFLIP_NONE );
+
+          term->flip_pending = DFB_FALSE;
+     }
+}
+
 static int unichar_to_utf8( unsigned int c, char *s )
 {
      int len = 0;
@@ -621,16 +631,6 @@ static void term_scroll( Term *term, int scroll )
      term_update_scrollbar( term );
 }
 
-static void term_flush_flip( Term *term )
-{
-     if (term->flip_pending) {
-          term->surface->Flip( term->surface, &term->flip_region,
-                               getenv( "LITE_WINDOW_DOUBLEBUFFER" ) ? DSFLIP_BLIT : DSFLIP_NONE );
-
-          term->flip_pending = DFB_FALSE;
-     }
-}
-
 /**********************************************************************************************************************/
 
 static void *term_update( DirectThread *thread, void *arg )
@@ -639,6 +639,7 @@ static void *term_update( DirectThread *thread, void *arg )
      struct _vtx *vtx  = term->vtx;
 
      while (1) {
+          int            status;
           int            count, update = 0;
           char           buffer[4096];
           fd_set         set;
@@ -651,7 +652,8 @@ static void *term_update( DirectThread *thread, void *arg )
           tv.tv_sec  = 10;
           tv.tv_usec = 0;
 
-          if (select( MAX( vtx->vt.childfd, vtx->vt.msgfd ) + 1, &set, NULL, NULL, &tv ) < 0) {
+          status = select( MAX( vtx->vt.childfd, vtx->vt.msgfd ) + 1, &set, NULL, NULL, &tv );
+          if (status < 0) {
                D_PERROR( "select() failed!\n" );
 
                if (errno == EINTR)
@@ -659,6 +661,9 @@ static void *term_update( DirectThread *thread, void *arg )
 
                break;
           }
+
+          if (status == 0)
+               continue;
 
           if (FD_ISSET( vtx->vt.msgfd, &set )) {
                term->update_closing = true;
@@ -714,8 +719,6 @@ static int on_window_resize( LiteWindow *window, int width, int height )
      /* Initialize sub area for terminal */
      rect.x = 0; rect.y = 0; rect.w = term->width; rect.h = term->height;
      window->box.surface->GetSubSurface( window->box.surface, &rect, &term->surface );
-
-     term->surface->Clear( term->surface, default_red[17], default_grn[17], default_blu[17], TERM_BGALPHA );
 
      term->surface->SetFont( term->surface, term->font );
 
@@ -908,8 +911,6 @@ int main( int argc, char *argv[] )
      rect.x = 0; rect.y = 0; rect.w = term->width; rect.h = term->height;
      term->window->box.surface->GetSubSurface( term->window->box.surface, &rect, &term->surface );
 
-     term->surface->Clear( term->surface, default_red[17], default_grn[17], default_blu[17], TERM_BGALPHA );
-
      term->surface->SetFont( term->surface, term->font );
 
      /* Initialize sub area for scroll bar */
@@ -933,6 +934,10 @@ int main( int argc, char *argv[] )
      }
      else
           term->vtx = vtx;
+
+     term->surface->Clear( term->surface, default_red[17], default_grn[17], default_blu[17], TERM_BGALPHA );
+
+     vt_scrollback_set( &vtx->vt, TERM_LINES );
 
      vtx->draw_text    = vt_draw_text;
      vtx->scroll_area  = vt_scroll_area;
@@ -972,10 +977,6 @@ int main( int argc, char *argv[] )
      direct_mutex_lock( &term->lock );
 
      term->update_thread = direct_thread_create( DTT_DEFAULT, term_update, term, "Term Update" );
-
-     vt_cursor_state( term, 1 );
-
-     vt_scrollback_set( &vtx->vt, TERM_LINES );
 
      /* Show the terminal window */
      lite_set_window_opacity( term->window, liteFullWindowOpacity );
