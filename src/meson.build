@@ -14,14 +14,38 @@
 #  with this program; if not, write to the Free Software Foundation, Inc.,
 #  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
 
-if with_system_libzvt
 
-executable('dfbterm', 'dfbterm.c', include_directories: config_inc, dependencies: [libzvt_dep, lite_dep], install: true)
+dfbterm_sources = [
+  'dfbterm.c'
+]
+
+if use_libtsm
+
+dfbterm_sources += [
+  'shl-pty.c',
+  'shl-ring.c'
+]
+
+executable('dfbterm',
+           dfbterm_sources,
+           include_directories: config_inc,
+           c_args: '-DUSE_LIBTSM',
+           dependencies: [libtsm_dep, lite_dep],
+           install: true)
 
 else
 
-dfbterm_sources = [
-  'dfbterm.c',
+if with_system_libzvt
+
+executable('dfbterm',
+           dfbterm_sources,
+           include_directories: config_inc,
+           dependencies: [libzvt_dep, lite_dep],
+           install: true)
+
+else
+
+dfbterm_sources += [
   'glib.c',
   'libzvt/gnome-login-support.c',
   'libzvt/lists.c',
@@ -53,5 +77,7 @@ executable('dfbterm-pty-helper',
 install_symlink('gnome-pty-helper',
                 pointing_to: 'dfbterm-pty-helper',
                 install_dir: dfbtermlibexecdir)
+
+endif
 
 endif

@@ -19,7 +19,13 @@
 #include <config.h>
 #include <direct/thread.h>
 #include <directfb.h>
+#ifdef USE_LIBTSM
+#include <libtsm.h>
+#include <shl-pty.h>
+#include <sys/wait.h>
+#else
 #include <libzvt/vtx.h>
+#endif
 #include <lite/lite.h>
 #include <lite/window.h>
 #include <pwd.h>
@@ -43,7 +49,16 @@ typedef struct {
      IDirectFBSurface           *bar_surface;
      int                         bar_start, bar_end;
 
+#ifdef USE_LIBTSM
+     struct tsm_screen          *screen;
+     struct tsm_vte             *vte;
+     struct shl_pty             *pty;
+     int                         pty_bridge;
+     pid_t                       pid;
+     tsm_age_t                   age;
+#else
      struct _vtx                *vtx;
+#endif
 
      DirectThread               *update_thread;
      bool                        update_closing;
@@ -61,6 +76,8 @@ typedef struct {
      DFBInputDeviceModifierMask  modifiers;
 } Term;
 
+#ifndef USE_LIBTSM
+
 /* The first 16 values are the ANSI colors, the last two are the default foreground and default background */
 
 static const u8 default_red[] = {
@@ -74,6 +91,8 @@ static const u8 default_grn[] = {
 static const u8 default_blu[] = {
      0x00, 0x00, 0x00, 0x00, 0xaa, 0xaa, 0xaa, 0xbb, 0x77, 0x55, 0x55, 0x55, 0xff, 0xff, 0xff, 0xff, 0xb0, 0x00
 };
+
+#endif
 
 /**********************************************************************************************************************/
 
@@ -107,6 +126,89 @@ static void term_flush_flip( Term *term )
           term->flip_pending = DFB_FALSE;
      }
 }
+
+#ifdef USE_LIBTSM
+
+static void tsm_vte_write( struct tsm_vte* vte, const char *buffer, size_t count, void *user_data )
+{
+     Term *term = user_data;
+
+     shl_pty_write( term->pty, buffer, count );
+
+     shl_pty_dispatch( term->pty );
+}
+
+static int tsm_draw_cell( struct tsm_screen *screen, uint64_t id, const uint32_t *ch, size_t size, uint32_t len,
+                          uint32_t col, uint32_t row, const struct tsm_screen_attr *attr, tsm_age_t age, void *user_data )
+{
+     DFBRegion  region;
+     int        i, x, y, fga, bga;
+     u8         fr, fg, fb, br, bg, bb;
+     Term      *term = user_data;
+
+     if (age <= term->age)
+          return 0;
+
+     fr = attr->fr;
+     fg = attr->fg;
+     fb = attr->fb;
+     br = attr->br;
+     bg = attr->bg;
+     bb = attr->bb;
+
+     if (attr->inverse) {
+          i = fr; fr = br; br = i;
+          i = fg; fg = bg; bg = i;
+          i = fb; fb = bb; bb = i;
+
+          fga  = TERM_BGALPHA;
+          bga  = 0xff;
+     }
+     else {
+          fga  = 0xff;
+          bga  = TERM_BGALPHA;
+     }
+
+     x = col * term->CW;
+     y = row * term->CH;
+
+     region.x1 = x;
+     region.y1 = y;
+     region.x2 = x + len * term->CW - 1;
+     region.y2 = y + term->CH - 1;
+
+     term->surface->SetColor( term->surface, br, bg, bb, bga );
+
+     term->surface->FillRectangle( term->surface, x, y, term->CW * len, term->CH );
+
+     if (size) {
+          term->surface->SetColor( term->surface, fr, fg, fb, fga );
+
+          term->surface->DrawGlyph( term->surface, *ch, x, y, DSTF_TOPLEFT );
+     }
+
+     if (!term->in_resize)
+          add_flip( term, &region );
+
+     return 0;
+}
+
+static void shl_pty_input( struct shl_pty *pty, void *user_data, char *buffer, size_t count )
+{
+     Term *term = user_data;
+
+     direct_mutex_lock( &term->lock );
+
+     tsm_vte_input( term->vte, buffer, count );
+
+     term->age = tsm_screen_draw( term->screen, tsm_draw_cell, term );
+
+     term_flush_flip( term );
+
+     direct_mutex_unlock( &term->lock );
+}
+
+#else
 
 static int unichar_to_utf8( unsigned int c, char *s )
 {
@@ -244,10 +346,13 @@ static int vt_cursor_state( void *user_data, int state )
      return term->cursor_state;
 }
 
+#endif
+
 /**********************************************************************************************************************/
 
 static void term_update_scrollbar( Term *term )
 {
+#ifndef USE_LIBTSM
      int          termrows, start, end, total;
      struct _vtx *vtx = term->vtx;
 
@@ -284,15 +389,16 @@ static void term_update_scrollbar( Term *term )
 
      term->bar_start = start;
      term->bar_end   = end;
+#endif
 }
 
 static void term_handle_button( Term *term, DFBWindowEvent *evt )
 {
+#ifndef USE_LIBTSM
      int          button;
      int          down;
      long long    diff;
      int          qual = 0;
-     struct _vtx *vtx  = term->vtx;
 
      switch (evt->button) {
           case DIBI_LEFT:
@@ -325,19 +431,19 @@ static void term_handle_button( Term *term, DFBWindowEvent *evt )
      evt->x /= term->CW;
      evt->y /= term->CH;
 
-     if (vtx->selectiontype == VT_SELTYPE_NONE) {
-          if (!(evt->modifiers & DIMM_SHIFT) && vt_report_button( &vtx->vt, down, button, qual, evt->x, evt->y ))
+     if (term->vtx->selectiontype == VT_SELTYPE_NONE) {
+          if (!(evt->modifiers & DIMM_SHIFT) && vt_report_button( &term->vtx->vt, down, button, qual, evt->x, evt->y ))
                return;
      }
 
-     evt->y += vtx->vt.scrollbackoffset;
+     evt->y += term->vtx->vt.scrollbackoffset;
 
      if (down) {
-          if (vtx->selected) {
-               vtx->selstartx = vtx->selendx;
-               vtx->selstarty = vtx->selendy;
-               vt_draw_selection( vtx );
-               vtx->selected = 0;
+          if (term->vtx->selected) {
+               term->vtx->selstartx = term->vtx->selendx;
+               term->vtx->selstarty = term->vtx->selendy;
+               vt_draw_selection( term->vtx );
+               term->vtx->selected = 0;
           }
 
           switch (evt->button) {
@@ -348,27 +454,27 @@ static void term_handle_button( Term *term, DFBWindowEvent *evt )
                            (evt->timestamp.tv_usec - term->last_click.tv_usec);
 
                     if ((evt->modifiers & DIMM_CONTROL) || diff < 400000)
-                         vtx->selectiontype = VT_SELTYPE_WORD | VT_SELTYPE_MOVED;
+                         term->vtx->selectiontype = VT_SELTYPE_WORD | VT_SELTYPE_MOVED;
                     else
-                         vtx->selectiontype = VT_SELTYPE_CHAR;
+                         term->vtx->selectiontype = VT_SELTYPE_CHAR;
 
-                    vtx->selectiontype |= VT_SELTYPE_BYSTART;
+                    term->vtx->selectiontype |= VT_SELTYPE_BYSTART;
 
-                    vtx->selstartx = evt->x;
-                    vtx->selstarty = evt->y;
-                    vtx->selendx   = evt->x;
-                    vtx->selendy   = evt->y;
+                    term->vtx->selstartx = evt->x;
+                    term->vtx->selstarty = evt->y;
+                    term->vtx->selendx   = evt->x;
+                    term->vtx->selendy   = evt->y;
 
-                    if (!vtx->selected) {
-                         vtx->selstartxold = evt->x;
-                         vtx->selstartyold = evt->y;
-                         vtx->selendxold   = evt->x;
-                         vtx->selendyold   = evt->y;
-                         vtx->selected = 1;
+                    if (!term->vtx->selected) {
+                         term->vtx->selstartxold = evt->x;
+                         term->vtx->selstartyold = evt->y;
+                         term->vtx->selendxold   = evt->x;
+                         term->vtx->selendyold   = evt->y;
+                         term->vtx->selected = 1;
                     }
 
-                    vt_fix_selection( vtx );
-                    vt_draw_selection( vtx );
+                    vt_fix_selection( term->vtx );
+                    vt_draw_selection( term->vtx );
 
                     term->last_click = evt->timestamp;
                     break;
@@ -391,12 +497,12 @@ static void term_handle_button( Term *term, DFBWindowEvent *evt )
                                    if (buffer[i] == '\n')
                                         buffer[i] = '\r';
 
-                              vt_writechild( &vtx->vt, buffer, size );
+                              vt_writechild( &term->vtx->vt, buffer, size );
 
-                              if (vtx->vt.scrollbackoffset) {
-                                   vtx->vt.scrollbackoffset = 0;
+                              if (term->vtx->vt.scrollbackoffset) {
+                                   term->vtx->vt.scrollbackoffset = 0;
 
-                                   vt_update( vtx, UPDATE_SCROLLBACK );
+                                   vt_update( term->vtx, UPDATE_SCROLLBACK );
 
                                    vt_cursor_state( term, 1 );
 
@@ -414,38 +520,38 @@ static void term_handle_button( Term *term, DFBWindowEvent *evt )
           }
      }
      else {
-          if (vtx->selectiontype & VT_SELTYPE_BYSTART) {
-               vtx->selendx = evt->x + 1;
-               vtx->selendy = evt->y;
+          if (term->vtx->selectiontype & VT_SELTYPE_BYSTART) {
+               term->vtx->selendx = evt->x + 1;
+               term->vtx->selendy = evt->y;
           }
           else {
-               vtx->selstartx = evt->x;
-               vtx->selstarty = evt->y;
+               term->vtx->selstartx = evt->x;
+               term->vtx->selstarty = evt->y;
           }
 
-          if (vtx->selectiontype & VT_SELTYPE_MOVED) {
+          if (term->vtx->selectiontype & VT_SELTYPE_MOVED) {
                int        size;
                char      *clip_data;
                IDirectFB *dfb = lite_get_dfb_interface();
 
-               vt_fix_selection( vtx );
-               vt_draw_selection( vtx );
+               vt_fix_selection( term->vtx );
+               vt_draw_selection( term->vtx );
 
-               clip_data = vt_get_selection( vtx, 1, &size );
+               clip_data = vt_get_selection( term->vtx, 1, &size );
 
                dfb->SetClipboardData( dfb, "text/plain", clip_data, size, NULL );
           }
 
-          vtx->selectiontype = VT_SELTYPE_NONE;
+          term->vtx->selectiontype = VT_SELTYPE_NONE;
 
           term->window->window->UngrabPointer( term->window->window );
      }
+#endif
 }
 
 static void term_handle_motion( Term *term, DFBWindowEvent *evt )
 {
-     struct _vtx *vtx = term->vtx;
-
+#ifndef USE_LIBTSM
      if (!getenv( "LITE_NO_FRAME" )) {
           evt->x -= 5;
           evt->y -= 23;
@@ -454,30 +560,80 @@ static void term_handle_motion( Term *term, DFBWindowEvent *evt )
      evt->x /= term->CW;
      evt->y /= term->CH;
 
-     if (vtx->selectiontype != VT_SELTYPE_NONE) {
-          if (vtx->selectiontype & VT_SELTYPE_BYSTART) {
-               vtx->selendx = evt->x + 1;
-               vtx->selendy = evt->y + vtx->vt.scrollbackoffset;
+     if (term->vtx->selectiontype != VT_SELTYPE_NONE) {
+          if (term->vtx->selectiontype & VT_SELTYPE_BYSTART) {
+               term->vtx->selendx = evt->x + 1;
+               term->vtx->selendy = evt->y + term->vtx->vt.scrollbackoffset;
           }
           else {
-               vtx->selstartx = evt->x;
-               vtx->selstarty = evt->y + vtx->vt.scrollbackoffset;
+               term->vtx->selstartx = evt->x;
+               term->vtx->selstarty = evt->y + term->vtx->vt.scrollbackoffset;
           }
 
-          vtx->selectiontype |= VT_SELTYPE_MOVED;
+          term->vtx->selectiontype |= VT_SELTYPE_MOVED;
 
-          vt_fix_selection( vtx );
-          vt_draw_selection( vtx );
+          vt_fix_selection( term->vtx );
+          vt_draw_selection( term->vtx );
      }
+#endif
 }
 
 static void term_handle_key( Term *term, DFBWindowEvent *evt )
 {
-     struct _vtx *vtx = term->vtx;
+#ifdef USE_LIBTSM
+     struct {
+          uint32_t key_symbol;
+          uint32_t keysym;
+     } key_maps[] = {
+          { DIKS_BACKSPACE,    0xff08 },
+          { DIKS_TAB,          0xff09 },
+          { DIKS_DELETE,       0xffff },
+          { DIKS_INSERT,       0xff63 },
+          { DIKS_CURSOR_LEFT,  0xff51 },
+          { DIKS_CURSOR_UP,    0xff52 },
+          { DIKS_CURSOR_RIGHT, 0xff53 },
+          { DIKS_CURSOR_DOWN,  0xff54 },
+          { DIKS_HOME,         0xff50 },
+          { DIKS_END,          0xff57 },
+          { DIKS_PAGE_UP,      0xff55 },
+          { DIKS_PAGE_DOWN,    0xff56 },
+          { DIKS_F1,           0xffbe },
+          { DIKS_F2,           0xffbf },
+          { DIKS_F3,           0xffc0 },
+          { DIKS_F4,           0xffc1 },
+          { DIKS_F5,           0xffc2 },
+          { DIKS_F6,           0xffc3 },
+          { DIKS_F7,           0xffc4 },
+          { DIKS_F8,           0xffc5 },
+          { DIKS_F9,           0xffc6 },
+          { DIKS_F10,          0xffc7 },
+          { DIKS_F11,          0xffc8 },
+          { DIKS_F12,          0xffc9 }
+     };
 
+     int      i;
+     uint32_t mods   = 0;
+     uint32_t keysym = evt->key_symbol;
+
+     if (evt->modifiers & DIMM_ALT)
+          mods |= TSM_ALT_MASK;
+     if (evt->modifiers & DIMM_CONTROL)
+          mods |= TSM_CONTROL_MASK;
+     if (evt->modifiers & DIMM_SHIFT)
+          mods |= TSM_SHIFT_MASK;
+
+     for (i = 0; i < D_ARRAY_SIZE(key_maps); i++)
+          if (evt->key_symbol == key_maps[i].key_symbol) {
+               keysym = key_maps[i].keysym;
+               break;
+          }
+
+     if (evt->key_symbol != DIKS_ALT && evt->key_symbol != DIKS_CONTROL && evt->key_symbol != DIKS_SHIFT)
+          tsm_vte_handle_keyboard( term->vte, keysym, 0, mods, evt->key_symbol );
+#else
      if (evt->modifiers == DIMM_CONTROL && evt->key_symbol >= DIKS_SMALL_A && evt->key_symbol <= DIKS_SMALL_Z) {
           char c = evt->key_symbol - DIKS_SMALL_A + 1;
-          vt_writechild( &vtx->vt, &c, 1 );
+          vt_writechild( &term->vtx->vt, &c, 1 );
      }
      else if ((evt->key_symbol > 9 && evt->key_symbol < 127) || (evt->key_symbol > 127 && evt->key_symbol < 256)) {
           char c = evt->key_symbol;
@@ -485,94 +641,94 @@ static void term_handle_key( Term *term, DFBWindowEvent *evt )
           if (evt->modifiers & DIMM_CONTROL) {
                switch (evt->key_symbol) {
                     case ' ':
-                         vt_writechild( &vtx->vt, "\000", 1 );
+                         vt_writechild( &term->vtx->vt, "\000", 1 );
                          break;
                     case '3':
                     case '[':
-                         vt_writechild( &vtx->vt, "\033", 1 );
+                         vt_writechild( &term->vtx->vt, "\033", 1 );
                          break;
                     case '4':
                     case '\\':
-                         vt_writechild( &vtx->vt, "\034", 1 );
+                         vt_writechild( &term->vtx->vt, "\034", 1 );
                          break;
                     case '5':
                     case ']':
-                         vt_writechild( &vtx->vt, "\035", 1 );
+                         vt_writechild( &term->vtx->vt, "\035", 1 );
                          break;
                     case '6':
-                         vt_writechild( &vtx->vt, "\036", 1 );
+                         vt_writechild( &term->vtx->vt, "\036", 1 );
                          break;
                     case '7':
                     case '-':
-                         vt_writechild( &vtx->vt, "\037", 1 );
+                         vt_writechild( &term->vtx->vt, "\037", 1 );
                          break;
                     default:
-                         vt_writechild( &vtx->vt, &c, 1 );
+                         vt_writechild( &term->vtx->vt, &c, 1 );
                          break;
                }
           }
           else
-               vt_writechild( &vtx->vt, &c, 1 );
+               vt_writechild( &term->vtx->vt, &c, 1 );
      }
      else {
           switch (evt->key_symbol) {
                case DIKS_BACKSPACE:
-                    vt_writechild( &vtx->vt, "\177", 1 );
+                    vt_writechild( &term->vtx->vt, "\177", 1 );
                     break;
                case DIKS_TAB:
                     if (evt->modifiers & DIMM_SHIFT)
-                         vt_writechild( &vtx->vt, "\033[Z", 3 );
+                         vt_writechild( &term->vtx->vt, "\033[Z", 3 );
                     else
-                         vt_writechild( &vtx->vt, "\t", 1 );
+                         vt_writechild( &term->vtx->vt, "\t", 1 );
                     break;
                case DIKS_DELETE:
-                    vt_writechild( &vtx->vt, "\033[3~", 4 );
+                    vt_writechild( &term->vtx->vt, "\033[3~", 4 );
                     break;
                case DIKS_INSERT:
-                    vt_writechild( &vtx->vt, "\033[2~", 4 );
+                    vt_writechild( &term->vtx->vt, "\033[2~", 4 );
                     break;
                case DIKS_CURSOR_LEFT:
-                    vt_writechild( &vtx->vt, "\033[D", 3 );
+                    vt_writechild( &term->vtx->vt, "\033[D", 3 );
                     break;
                case DIKS_CURSOR_RIGHT:
-                    vt_writechild( &vtx->vt, "\033[C", 3 );
+                    vt_writechild( &term->vtx->vt, "\033[C", 3 );
                     break;
                case DIKS_CURSOR_UP:
-                    vt_writechild( &vtx->vt, "\033[A", 3 );
+                    vt_writechild( &term->vtx->vt, "\033[A", 3 );
                     break;
                case DIKS_CURSOR_DOWN:
-                    vt_writechild( &vtx->vt, "\033[B", 3 );
+                    vt_writechild( &term->vtx->vt, "\033[B", 3 );
                     break;
                case DIKS_HOME:
-                    vt_writechild( &vtx->vt, "\033OH", 3 );
+                    vt_writechild( &term->vtx->vt, "\033OH", 3 );
                     break;
                case DIKS_END:
-                    vt_writechild( &vtx->vt, "\033OF", 3 );
+                    vt_writechild( &term->vtx->vt, "\033OF", 3 );
                     break;
                case DIKS_PAGE_UP:
-                    vt_writechild( &vtx->vt, "\033[5~", 4 );
+                    vt_writechild( &term->vtx->vt, "\033[5~", 4 );
                     break;
                case DIKS_PAGE_DOWN:
-                    vt_writechild( &vtx->vt, "\033[6~", 4 );
+                    vt_writechild( &term->vtx->vt, "\033[6~", 4 );
                     break;
                case DIKS_F1:
-                    vt_writechild( &vtx->vt, "\033OP", 3 );
+                    vt_writechild( &term->vtx->vt, "\033OP", 3 );
                     break;
                case DIKS_F2:
-                    vt_writechild( &vtx->vt, "\033OQ", 3 );
+                    vt_writechild( &term->vtx->vt, "\033OQ", 3 );
                     break;
                case DIKS_F3:
-                    vt_writechild( &vtx->vt, "\033OR", 3 );
+                    vt_writechild( &term->vtx->vt, "\033OR", 3 );
                     break;
                case DIKS_F4:
-                    vt_writechild( &vtx->vt, "\033OS", 3 );
+                    vt_writechild( &term->vtx->vt, "\033OS", 3 );
                     break;
                case DIKS_F5 ... DIKS_F12: {
                          char                buf[6];
                          const unsigned char f5_f12_remap[] = { 15, 17, 18, 19, 20, 21, 23,24 };
 
                          sprintf( buf, "\033[%d~", f5_f12_remap[evt->key_symbol-DIKS_F5] );
-                         vt_writechild( &vtx->vt, buf, strlen( buf ) );
+                         vt_writechild( &term->vtx->vt, buf, strlen( buf ) );
                     }
                     break;
                default:
@@ -580,79 +736,90 @@ static void term_handle_key( Term *term, DFBWindowEvent *evt )
           }
      }
 
-     if (vtx->selected) {
-          vtx->selstartx = vtx->selendx;
-          vtx->selstarty = vtx->selendy;
-          vt_draw_selection( vtx );
-          vtx->selected = 0;
+     if (term->vtx->selected) {
+          term->vtx->selstartx = term->vtx->selendx;
+          term->vtx->selstarty = term->vtx->selendy;
+          vt_draw_selection( term->vtx );
+          term->vtx->selected = 0;
      }
 
-     if (vtx->vt.scrollbackoffset) {
-          vtx->vt.scrollbackoffset = 0;
+     if (term->vtx->vt.scrollbackoffset) {
+          term->vtx->vt.scrollbackoffset = 0;
 
-          vt_update( vtx, UPDATE_SCROLLBACK );
+          vt_update( term->vtx, UPDATE_SCROLLBACK );
 
           vt_cursor_state( term, 1 );
 
           term_update_scrollbar( term );
      }
+#endif
 }
 
 static void term_handle_wheel( Term *term, DFBWindowEvent *evt )
 {
-     int          i;
-     struct _vtx *vtx = term->vtx;
+#ifndef USE_LIBTSM
+     int i;
 
      if (evt->step > 0) {
           for (i = 0; i < evt->step; i++)
-               vt_writechild( &vtx->vt, "\033[A", 3 );
+               vt_writechild( &term->vtx->vt, "\033[A", 3 );
      }
      else {
           for (i = 0; i > evt->step; i--)
-               vt_writechild( &vtx->vt, "\033[B", 3 );
+               vt_writechild( &term->vtx->vt, "\033[B", 3 );
      }
+#endif
 }
 
 static void term_scroll( Term *term, int scroll )
 {
-     struct _vtx *vtx = term->vtx;
+#ifndef USE_LIBTSM
+     term->vtx->vt.scrollbackoffset += scroll;
 
-     vtx->vt.scrollbackoffset += scroll;
+     if (term->vtx->vt.scrollbackoffset > 0)
+          term->vtx->vt.scrollbackoffset = 0;
+     else if (term->vtx->vt.scrollbackoffset < -term->vtx->vt.scrollbacklines)
+          term->vtx->vt.scrollbackoffset = -term->vtx->vt.scrollbacklines;
 
-     if (vtx->vt.scrollbackoffset > 0)
-          vtx->vt.scrollbackoffset = 0;
-     else if (vtx->vt.scrollbackoffset < -vtx->vt.scrollbacklines)
-          vtx->vt.scrollbackoffset = -vtx->vt.scrollbacklines;
-
-     vt_update( vtx, UPDATE_SCROLLBACK );
+     vt_update( term->vtx, UPDATE_SCROLLBACK );
 
      vt_cursor_state( term, 1 );
 
      term_update_scrollbar( term );
+#endif
 }
 
 /**********************************************************************************************************************/
 
 static void *term_update( DirectThread *thread, void *arg )
 {
-     Term        *term = arg;
-     struct _vtx *vtx  = term->vtx;
+     Term *term = arg;
 
      while (1) {
           int            status;
+#ifndef USE_LIBTSM
           int            count, update = 0;
           char           buffer[4096];
+#endif
           fd_set         set;
           struct timeval tv;
 
           FD_ZERO( &set );
-          FD_SET( vtx->vt.childfd, &set );
-          FD_SET( vtx->vt.msgfd, &set );
+#ifdef USE_LIBTSM
+          FD_SET( term->pty_bridge, &set );
+#else
+          FD_SET( term->vtx->vt.childfd, &set );
+          FD_SET( term->vtx->vt.msgfd, &set );
+#endif
 
           tv.tv_sec  = 10;
           tv.tv_usec = 0;
 
-          status = select( MAX( vtx->vt.childfd, vtx->vt.msgfd ) + 1, &set, NULL, NULL, &tv );
+#ifdef USE_LIBTSM
+          status = select( term->pty_bridge + 1, &set, NULL, NULL, &tv );
+#else
+          status = select( MAX( term->vtx->vt.childfd, term->vtx->vt.msgfd ) + 1, &set, NULL, NULL, &tv );
+#endif
           if (status < 0) {
                D_PERROR( "select() failed!\n" );
 
@@ -665,23 +832,32 @@ static void *term_update( DirectThread *thread, void *arg )
           if (status == 0)
                continue;
 
-          if (FD_ISSET( vtx->vt.msgfd, &set )) {
+#ifdef USE_LIBTSM
+          if (waitpid( term->pid, &status, WNOHANG ) > 0) {
                term->update_closing = true;
                break;
           }
 
-          while ((count = read( vtx->vt.childfd, buffer, sizeof(buffer) )) > 0) {
+          if (FD_ISSET( term->pty_bridge, &set ))
+               shl_pty_bridge_dispatch( term->pty_bridge, 0 );
+#else
+          if (FD_ISSET( term->vtx->vt.msgfd, &set )) {
+               term->update_closing = true;
+               break;
+          }
+
+          while ((count = read( term->vtx->vt.childfd, buffer, sizeof(buffer) )) > 0) {
                vt_cursor_state( term, 0 );
 
                update = 1;
 
-               vt_parse_vt( &vtx->vt, buffer, count );
+               vt_parse_vt( &term->vtx->vt, buffer, count );
           }
 
           if (update) {
                direct_mutex_lock( &term->lock );
 
-               vt_update( vtx, UPDATE_CHANGES );
+               vt_update( term->vtx, UPDATE_CHANGES );
 
                vt_cursor_state( term, 1 );
 
@@ -691,6 +867,7 @@ static void *term_update( DirectThread *thread, void *arg )
 
                direct_mutex_unlock( &term->lock );
           }
+#endif
      }
 
      return NULL;
@@ -701,7 +878,6 @@ static int on_window_resize( LiteWindow *window, int width, int height )
      DFBRectangle  rect;
      int           termcols, termrows;
      Term         *term = LITE_BOX(window)->user_data;
-     struct _vtx  *vtx  = term->vtx;
 
      term->in_resize = DFB_TRUE;
 
@@ -726,12 +902,17 @@ static int on_window_resize( LiteWindow *window, int width, int height )
      rect.x = term->width; rect.w = 2;
      window->box.surface->GetSubSurface( window->box.surface, &rect, &term->bar_surface );
 
-     /* VTX */
-     vt_resize( &vtx->vt, termcols, termrows, term->width, term->height );
+#ifdef USE_LIBTSM
+     tsm_screen_resize( term->screen, termcols, termrows );
 
-     vt_update_rect( vtx, 1, 0, 0, termcols, termrows );
+     shl_pty_resize( term->pty, termcols, termrows );
+#else
+     vt_resize( &term->vtx->vt, termcols, termrows, term->width, term->height );
+
+     vt_update_rect( term->vtx, 1, 0, 0, termcols, termrows );
 
      vt_cursor_state( term, 1 );
+#endif
 
      term_update_scrollbar( term );
 
@@ -771,7 +952,6 @@ int main( int argc, char *argv[] )
      int                   i;
      Term                 *term;
      IDirectFBEventBuffer *event_buffer;
-     struct _vtx          *vtx = NULL;
 
      /* Parse command line */
      for (i = 1; i < argc; i++) {
@@ -925,26 +1105,48 @@ int main( int argc, char *argv[] )
      /* Create event buffer */
      lite_get_event_buffer( &event_buffer );
 
-     /* VTX */
-     vtx = vtx_new( termcols, termrows, term );
-     if (!vtx) {
+#ifdef USE_LIBTSM
+     if (tsm_screen_new( &term->screen, NULL, term )) {
+          DirectFBError( "Failed to create Screen object", DFB_FAILURE );
+          ret = DFB_FAILURE;
+          goto out;
+     }
+
+     if (tsm_vte_new( &term->vte, term->screen, tsm_vte_write, term, NULL, term )) {
+          DirectFBError( "Failed to create VTE object", DFB_FAILURE );
+          ret = DFB_FAILURE;
+          goto out;
+     }
+     else {
+          struct tsm_screen_attr attr;
+          tsm_vte_get_def_attr( term->vte, &attr );
+          term->surface->Clear( term->surface, attr.br, attr.bg, attr.bb, TERM_BGALPHA );
+     }
+
+     tsm_screen_set_max_sb( term->screen, TERM_LINES );
+#else
+     term->vtx = vtx_new( termcols, termrows, term );
+     if (!term->vtx) {
           DirectFBError( "Failed to create VTX object", DFB_FAILURE );
           ret = DFB_FAILURE;
           goto out;
      }
      else
-          term->vtx = vtx;
+          term->surface->Clear( term->surface, default_red[17], default_grn[17], default_blu[17], TERM_BGALPHA );
 
-     term->surface->Clear( term->surface, default_red[17], default_grn[17], default_blu[17], TERM_BGALPHA );
+     vt_scrollback_set( &term->vtx->vt, TERM_LINES );
 
-     vt_scrollback_set( &vtx->vt, TERM_LINES );
+     term->vtx->draw_text    = vt_draw_text;
+     term->vtx->scroll_area  = vt_scroll_area;
+     term->vtx->cursor_state = vt_cursor_state;
+     term->vtx->scroll_type  = VT_SCROLL_SOMETIMES;
+#endif
 
-     vtx->draw_text    = vt_draw_text;
-     vtx->scroll_area  = vt_scroll_area;
-     vtx->cursor_state = vt_cursor_state;
-     vtx->scroll_type  = VT_SCROLL_SOMETIMES;
-
-     if ((i = vt_forkpty( &vtx->vt, 0 )) == 0) {
+#ifdef USE_LIBTSM
+     if ((i = shl_pty_open( &term->pty, shl_pty_input, term, termcols, termrows )) == 0) {
+#else
+     if ((i = vt_forkpty( &term->vtx->vt, 0 )) == 0) {
+#endif
           char          *shell, *name;
           struct passwd *pw;
 
@@ -971,6 +1173,16 @@ int main( int argc, char *argv[] )
           ret = DFB_FAILURE;
           goto out;
      }
+
+#ifdef USE_LIBTSM
+     term->pty_bridge = shl_pty_bridge_new();
+
+     shl_pty_bridge_add( term->pty_bridge, term->pty );
+
+     term->pid = shl_pty_get_child( term->pty );
+
+     tsm_screen_resize( term->screen, termcols, termrows );
+#endif
 
      direct_mutex_init( &term->lock );
 
@@ -1065,11 +1277,24 @@ int main( int argc, char *argv[] )
 
      direct_mutex_deinit( &term->lock );
 
-     vt_closepty( &vtx->vt );
+#ifdef USE_LIBTSM
+     shl_pty_bridge_free( term->pty_bridge );
+     shl_pty_close( term->pty );
+#else
+     vt_closepty( &term->vtx->vt );
+#endif
 
 out:
-     if (vtx)
-          vtx_destroy( vtx );
+#ifdef USE_LIBTSM
+     if (term->vte)
+          tsm_vte_unref( term->vte );
+
+     if (term->screen)
+          tsm_screen_unref( term->screen );
+#else
+     if (term->vtx)
+          vtx_destroy( term->vtx );
+#endif
 
      if (term->bar_surface)
           term->bar_surface->Release( term->bar_surface );

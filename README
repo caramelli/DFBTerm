@@ -1,7 +1,11 @@
 DFBTerm
 =======
 
-DFBTerm is a terminal emulator runnning on DirectFB and based on libzvt.
+DFBTerm is a terminal emulator running on DirectFB and can use either libtsm or libzvt
+as terminal emulation backend.
 
 libzvt (Zed's virtual terminal emulation library) is included directly in the source code,
 although it is possible to use the system's libzvt library.
+
+libtsm (Terminal-emulator state machine library) has an internal static helper library
+that is included in the source code.

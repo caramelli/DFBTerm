@@ -20,14 +20,31 @@ project('DFBTerm', 'c',
 dfbtermdatadir    = join_paths(get_option('prefix'), get_option('datadir'),    'dfbterm')
 dfbtermlibexecdir = join_paths(get_option('prefix'), get_option('libexecdir'), 'dfbterm')
 
-with_system_libzvt = get_option('system-libzvt')
+emulator = get_option('emulator')
+use_libtsm = false
+with_system_libzvt = false
 
-if with_system_libzvt
-  libzvt_dep = dependency('libzvt-2.0', required: false)
+if emulator == 'libtsm'
+  libtsm_dep = dependency('libtsm', required: false)
 
-  if not libzvt_dep.found()
-    warning('The included libzvt will be built.')
-    with_system_libzvt = false
+  if libtsm_dep.found()
+    use_libtsm = true
+  else
+    warning('libzvt will be used.')
+    emulator = 'libzvt'
+  endif
+endif
+
+if emulator == 'libzvt'
+  with_system_libzvt = get_option('system-libzvt')
+
+  if with_system_libzvt
+    libzvt_dep = dependency('libzvt-2.0', required: false)
+
+    if not libzvt_dep.found()
+      warning('The included libzvt will be built.')
+      with_system_libzvt = false
+    endif
   endif
 endif
 
@@ -39,7 +56,7 @@ else
   config_h.set_quoted('TERMFONTDIR', get_option('fontdir'), description: 'Terminal font directory.')
 endif
 
-if not with_system_libzvt
+if emulator == 'libzvt' and not with_system_libzvt
   config_h.set('HAVE_LOGIN_TTY', 1)
   config_h.set('HAVE_OPENPTY',   1)
   config_h.set('HAVE_PTY_H',     1)
